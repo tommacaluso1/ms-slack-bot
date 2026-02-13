@@ -61,6 +61,10 @@ FRESHDESK_KB_CATEGORY_NAME=Common Issues
 FRESHDESK_KB_FOLDER_VISIBILITY=3
 FRESHDESK_KB_LANGUAGE=en
 KB_MIN_CONFIDENCE=0.75
+
+# OpenAI
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4.1-mini
 ```
 
 ### What each variable controls
@@ -82,6 +86,8 @@ KB_MIN_CONFIDENCE=0.75
 - `FRESHDESK_KB_FOLDER_VISIBILITY`: Folder visibility (default `3`, Agents).
 - `FRESHDESK_KB_LANGUAGE`: Folder/article language.
 - `KB_MIN_CONFIDENCE`: Minimum confidence required before KB drafting.
+- `OPENAI_API_KEY`: API key used by HTTP Request nodes calling OpenAI Responses API.
+- `OPENAI_MODEL`: OpenAI model name (recommended `gpt-4.1-mini` for cost/performance).
 
 ---
 
@@ -107,6 +113,11 @@ These workflows use `HTTP Request` nodes with header-based Basic auth expression
 - password = `X`
 
 No separate n8n credential object is required by this export, but you can convert these nodes to a shared credential later if preferred.
+
+## C) OpenAI authentication
+- OpenAI calls are implemented with HTTP Request nodes against `https://api.openai.com/v1/responses`.
+- Auth header uses `OPENAI_API_KEY` (`Bearer` token).
+- No additional n8n credential is required unless you prefer central credential management.
 
 ---
 
@@ -182,31 +193,45 @@ Create a Freshdesk automation that sends resolved/closed ticket IDs to n8n.
 3. **Normalize Text** (Code)
    - Purpose:
      - Build normalized enquiry text from message + attachment/file hints.
-     - Create strict classifier-like JSON:
-       - `intent`, `category`, `summary`, `details`, `urgency`, `confidence`, tags, requester info.
-     - Apply fallback rule: if confidence `< 0.5`, set `intent=other` and tag `needs_triage`.
+     - Build a deterministic fallback classification object (used if AI call fails/parses badly).
 
-4. **Build Ticket Payload** (Code)
+4. **OpenAI Classify Enquiry** (HTTP Request)
+   - Purpose:
+     - Calls OpenAI Responses API to classify the message into strict JSON fields (`intent`, `summary`, `urgency`, `tags`, etc.).
+   - Reliability:
+     - `Continue On Fail` enabled so workflow can still proceed with fallback logic.
+
+5. **Merge Normalized + AI** (Merge)
+   - Purpose: Keeps both the normalized message context and AI response in the same item.
+
+6. **Parse AI Classification** (Code)
+   - Purpose:
+     - Parse JSON returned by OpenAI robustly (supports plain JSON or JSON embedded in text).
+     - Validate and sanitize fields.
+     - Fall back to deterministic classification when AI output is missing/invalid.
+     - Enforce triage fallback when confidence `< 0.5`.
+
+7. **Build Ticket Payload** (Code)
    - Purpose:
      - Construct Freshdesk `/tickets` payload.
      - Map urgency to priority.
      - Apply env defaults and optional group/product IDs.
 
-5. **Create Freshdesk Ticket** (HTTP Request)
+8. **Create Freshdesk Ticket** (HTTP Request)
    - Purpose: POST to `/api/v2/tickets`.
    - Auth: Basic header from `FRESHDESK_API_KEY:X`.
    - Continue On Fail: enabled to allow controlled error handling.
 
-6. **Ticket Created?** (IF)
+9. **Ticket Created?** (IF)
    - Purpose: Branch on whether response has ticket `id`.
 
-7. **Post Ack Enabled?** (IF)
+10. **Post Ack Enabled?** (IF)
    - Purpose: Check `SLACK_POST_ACK == true`.
 
-8. **Slack Thread Ack** (Slack)
+11. **Slack Thread Ack** (Slack)
    - Purpose: Reply in original Slack thread with created Freshdesk ticket number + URL.
 
-9. **Slack Error Alert** (Slack)
+12. **Slack Error Alert** (Slack)
    - Purpose: Post one compact failure message to ack channel.
 
 ---
@@ -240,48 +265,58 @@ Create a Freshdesk automation that sends resolved/closed ticket IDs to n8n.
      - Redact email, phone, likely addresses, likely names using regex.
      - Ensure downstream KB drafting uses redacted text only.
 
-7. **Draft KB JSON** (Code)
+7. **OpenAI Draft KB** (HTTP Request)
    - Purpose:
-     - Produce strict JSON fields for KB decision and draft content:
-       - `should_create_kb`, `confidence`, `kb_title`, `kb_problem`, `kb_steps`, tags, folder name, etc.
+     - Calls OpenAI Responses API to generate structured KB draft JSON from redacted ticket text.
+   - Reliability:
+     - `Continue On Fail` enabled to preserve fallback generation path.
 
-8. **KB Gate** (IF)
+8. **Merge Redacted + AI** (Merge)
+   - Purpose: Combines redacted ticket context with AI response.
+
+9. **Draft KB JSON** (Code)
+   - Purpose:
+     - Parse and sanitize AI JSON response.
+     - Apply deterministic fallback for any missing/invalid fields.
+     - Enforce confidence gate using `KB_MIN_CONFIDENCE`.
+
+10. **KB Gate** (IF)
    - Purpose: Continue only if `should_create_kb=true` and confidence ≥ `KB_MIN_CONFIDENCE`.
 
-9. **List Categories** (HTTP)
+11. **List Categories** (HTTP)
    - Purpose: GET existing Solutions categories.
 
-10. **Find Category** (Code)
+12. **Find Category** (Code)
     - Purpose: Match by `FRESHDESK_KB_CATEGORY_NAME`.
 
-11. **Category Missing?** (IF)
+13. **Category Missing?** (IF)
     - If missing → **Create Category** (HTTP POST)
     - Then **Merge Category** + **Normalize Category** to get `category_id`.
 
-12. **List Folders** (HTTP)
+14. **List Folders** (HTTP)
     - Purpose: GET folders in selected category.
 
-13. **Find Folder** (Code)
+15. **Find Folder** (Code)
     - Purpose: Match folder by generated `kb_folder_name`.
 
-14. **Folder Missing?** (IF)
+16. **Folder Missing?** (IF)
     - If missing → **Create Folder** (HTTP POST with visibility/language)
     - Then **Merge Folder** + **Normalize Folder** to get `folder_id`.
 
-15. **Search Articles** (HTTP)
+17. **Search Articles** (HTTP)
     - Purpose: Search potential duplicate KB articles by title term.
 
-16. **Find Article Match** (Code)
+18. **Find Article Match** (Code)
     - Purpose: Simple title similarity scoring; pick match when score threshold met.
 
-17. **Build Article Payload** (Code)
+19. **Build Article Payload** (Code)
     - Purpose: Construct article body HTML and payload with `status: 1` (draft).
 
-18. **Article Exists?** (IF)
+20. **Article Exists?** (IF)
     - True  → **Update Article Draft** (PUT)
     - False → **Create Article Draft** (POST)
 
-19. **Slack KB Error** (Slack)
+21. **Slack KB Error** (Slack)
     - Purpose: Alert channel when gate fails or critical path errors out.
 
 ---
@@ -324,6 +359,13 @@ For **workflow 2** specifically:
 - Check `KB Gate` values (`should_create_kb`, `confidence`, env threshold).
 - Validate Freshdesk solutions endpoints return data for your account.
 - Inspect `Search Articles` and match logic outputs.
+- Check OpenAI nodes for auth/model/rate-limit errors.
+
+### OpenAI call failed
+- Verify `OPENAI_API_KEY` is set in the same runtime where n8n executes.
+- Verify `OPENAI_MODEL` exists in your OpenAI account.
+- Confirm outbound network access from n8n to `api.openai.com`.
+- The workflows still run with fallback logic, but ticket/KB quality will be lower.
 
 ### Duplicate records
 - Ensure workflow static data persistence is enabled in your n8n deployment.

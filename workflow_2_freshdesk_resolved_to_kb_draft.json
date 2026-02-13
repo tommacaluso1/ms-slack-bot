@@ -97,14 +97,60 @@
     },
     {
       "parameters": {
-        "jsCode": "const txt = $json.redacted_text || '';\nconst subj = ($json.ticket.subject || 'Untitled').replace(/\\s+/g, ' ').trim();\nconst confidence = txt.length > 100 ? 0.82 : 0.55;\nconst steps = [];\nif (/password|login|access/i.test(txt)) {\n  steps.push('Verify account status and reset credentials if needed.');\n  steps.push('Clear cached credentials and retry sign in.');\n}\nif (/error|failed|exception|timeout/i.test(txt)) {\n  steps.push('Capture exact error and timestamp from logs.');\n  steps.push('Apply known fix or rollback recent change.');\n}\nif (!steps.length) steps.push('Review ticket history and apply documented troubleshooting steps.');\n\nconst kb = {\n  should_create_kb: confidence >= Number($env.KB_MIN_CONFIDENCE || 0.75),\n  confidence,\n  kb_title: `How to resolve: ${subj}`.slice(0, 200),\n  kb_problem: txt.slice(0, 400),\n  kb_environment: 'Freshdesk / Slack intake',\n  kb_steps: steps,\n  kb_resolution: 'Issue resolved using validated support workflow and corrective actions.',\n  kb_keywords: Array.from(new Set([...(($json.ticket.tags)||[]), 'support', 'resolved'])).slice(0, 10),\n  kb_folder_name: ($json.ticket.type || 'General').toString().slice(0, 60),\n  kb_article_tags: Array.from(new Set([...(($json.ticket.tags)||[]), 'draft', 'internal'])).slice(0, 15)\n};\nreturn [{ json: { ...$json, kb } }];"
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{`Bearer ${$env.OPENAI_API_KEY}`}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: $env.OPENAI_MODEL || 'gpt-4.1-mini', input: [ { role: 'system', content: 'You generate Freshdesk KB draft metadata from resolved ticket content. Return strict JSON only with keys: should_create_kb (boolean), confidence (0..1), kb_title, kb_problem, kb_environment, kb_steps (array), kb_resolution, kb_keywords (array), kb_folder_name, kb_article_tags (array). Output must already be redacted and safe for internal KB. Never include PII.' }, { role: 'user', content: `Create KB draft JSON from this redacted ticket content:\n\n${$json.redacted_text}` } ], text: { format: { type: 'json_object' } } } }}",
+        "options": {}
+      },
+      "id": "OpenAI Draft KB",
+      "name": "OpenAI Draft KB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        680
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition"
+      },
+      "id": "Merge Redacted + AI",
+      "name": "Merge Redacted + AI",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1920,
+        840
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $input.first().json || {};\nconst ai = $input.last().json || {};\nconst txt = base.redacted_text || '';\nconst subj = (base.ticket?.subject || 'Untitled').replace(/\\s+/g, ' ').trim();\n\nconst pickText = () => {\n  if (typeof ai.output_text === 'string' && ai.output_text.trim()) return ai.output_text;\n  const c = ai?.output?.[0]?.content;\n  if (Array.isArray(c)) {\n    const t = c.find(x => x.type === 'output_text' || x.type === 'text');\n    if (t?.text) return t.text;\n  }\n  const msg = ai?.choices?.[0]?.message?.content;\n  if (typeof msg === 'string') return msg;\n  return '';\n};\nconst extractJson = (raw) => {\n  if (!raw) return null;\n  try { return JSON.parse(raw); } catch {}\n  const s = raw.indexOf('{');\n  const e = raw.lastIndexOf('}');\n  if (s >= 0 && e > s) {\n    try { return JSON.parse(raw.slice(s, e + 1)); } catch {}\n  }\n  return null;\n};\n\nconst parsed = extractJson(pickText()) || {};\n\nconst fallbackConfidence = txt.length > 100 ? 0.82 : 0.55;\nconst fallbackSteps = [];\nif (/password|login|access/i.test(txt)) {\n  fallbackSteps.push('Verify account status and reset credentials if needed.');\n  fallbackSteps.push('Clear cached credentials and retry sign in.');\n}\nif (/error|failed|exception|timeout/i.test(txt)) {\n  fallbackSteps.push('Capture exact error and timestamp from logs.');\n  fallbackSteps.push('Apply known fix or rollback recent change.');\n}\nif (!fallbackSteps.length) fallbackSteps.push('Review ticket history and apply documented troubleshooting steps.');\n\nconst kb = {\n  should_create_kb: typeof parsed.should_create_kb === 'boolean' ? parsed.should_create_kb : (fallbackConfidence >= Number($env.KB_MIN_CONFIDENCE || 0.75)),\n  confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : fallbackConfidence,\n  kb_title: (parsed.kb_title || `How to resolve: ${subj}`).toString().slice(0, 200),\n  kb_problem: (parsed.kb_problem || txt.slice(0, 400)).toString(),\n  kb_environment: (parsed.kb_environment || 'Freshdesk / Slack intake').toString().slice(0, 200),\n  kb_steps: Array.isArray(parsed.kb_steps) && parsed.kb_steps.length ? parsed.kb_steps.map(String) : fallbackSteps,\n  kb_resolution: (parsed.kb_resolution || 'Issue resolved using validated support workflow and corrective actions.').toString(),\n  kb_keywords: Array.isArray(parsed.kb_keywords) ? parsed.kb_keywords.map(String).slice(0, 12) : Array.from(new Set([...(base.ticket?.tags || []), 'support', 'resolved'])).slice(0, 10),\n  kb_folder_name: (parsed.kb_folder_name || base.ticket?.type || 'General').toString().slice(0, 60),\n  kb_article_tags: Array.isArray(parsed.kb_article_tags) ? parsed.kb_article_tags.map(String).slice(0, 15) : Array.from(new Set([...(base.ticket?.tags || []), 'draft', 'internal'])).slice(0, 15)\n};\n\nif (kb.confidence < Number($env.KB_MIN_CONFIDENCE || 0.75)) kb.should_create_kb = false;\n\nreturn [{ json: { ...base, kb } }];"
       },
       "id": "Draft KB JSON",
       "name": "Draft KB JSON",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1680,
+        2160,
         840
       ]
     },
@@ -131,7 +177,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        1920,
+        2400,
         840
       ]
     },
@@ -154,7 +200,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        2160,
+        2640,
         760
       ]
     },
@@ -502,7 +548,7 @@
       "type": "n8n-nodes-base.slack",
       "typeVersion": 2,
       "position": [
-        2160,
+        2640,
         980
       ],
       "continueOnFail": true
@@ -568,7 +614,12 @@
       "main": [
         [
           {
-            "node": "Draft KB JSON",
+            "node": "OpenAI Draft KB",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Redacted + AI",
             "type": "main",
             "index": 0
           }
@@ -805,6 +856,28 @@
         [
           {
             "node": "Article Exists?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Draft KB": {
+      "main": [
+        [
+          {
+            "node": "Merge Redacted + AI",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Redacted + AI": {
+      "main": [
+        [
+          {
+            "node": "Draft KB JSON",
             "type": "main",
             "index": 0
           }
