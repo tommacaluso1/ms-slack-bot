@@ -5,10 +5,14 @@ This repo includes one n8n export containing two workflows:
 2. **Freshdesk Resolved → Knowledge Base Draft**
 
 ## 1) Import into n8n
-1. Open n8n → **Workflows** → **Import from file**.
+> This file is a **multi-workflow export bundle** (`meta + workflows[]`).
+
+1. Open n8n → **Settings** → **Import from File** (or **Admin → Import/Export** depending on n8n version).
 2. Select `n8n_export.json`.
 3. Confirm both workflows are imported.
 4. Open each workflow and map your Slack credentials in Slack Trigger/Slack nodes.
+
+If you use the in-editor single-workflow import, n8n may appear to do nothing because this file contains multiple workflows.
 
 ---
 
