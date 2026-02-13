@@ -1,8 +1,10 @@
 # n8n Workflows: Slack ↔ Freshdesk Enquiry + KB Drafting
 
-This package includes one n8n export (`n8n_export.json`) containing exactly two workflows:
-1. **Slack Enquiries → Freshdesk Tickets**
-2. **Freshdesk Resolved → Knowledge Base Draft**
+This package now includes **two separate n8n workflow JSON files** for reliable automatic import:
+1. `workflow_1_slack_enquiries_to_freshdesk_tickets.json` → **Slack Enquiries → Freshdesk Tickets**
+2. `workflow_2_freshdesk_resolved_to_kb_draft.json` → **Freshdesk Resolved → Knowledge Base Draft**
+
+A legacy combined bundle (`n8n_export.json`) is also present, but use the two separate files for automation/import APIs.
 
 This guide explains **what every node does**, **how to configure credentials/env vars**, and **how to test end-to-end**.
 
@@ -10,14 +12,16 @@ This guide explains **what every node does**, **how to configure credentials/env
 
 ## 1) Import the workflows correctly
 
-> `n8n_export.json` is a **multi-workflow bundle** (`meta + workflows[] + credentials[]`), not a single-workflow JSON.
+Use the two single-workflow files (recommended for UI and API automation):
 
-1. In n8n, open **Settings → Import from File** (or **Admin → Import/Export** depending on version).
-2. Select `n8n_export.json`.
-3. Confirm you now see both workflows by name.
-4. Open each workflow and complete credential mappings.
+1. In n8n, go to **Workflows** and import `workflow_1_slack_enquiries_to_freshdesk_tickets.json`.
+2. Import `workflow_2_freshdesk_resolved_to_kb_draft.json`.
+3. Confirm both workflow names appear exactly:
+   - `Slack Enquiries → Freshdesk Tickets`
+   - `Freshdesk Resolved → Knowledge Base Draft`
+4. Open each workflow and complete credential mappings before activation.
 
-If you try importing from the canvas “single workflow import” entry point, n8n may appear to do nothing.
+For API-based imports, upload each file as a standalone workflow object.
 
 ---
 
