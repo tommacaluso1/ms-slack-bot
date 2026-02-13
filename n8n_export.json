@@ -1,0 +1,1106 @@
+{
+  "meta": {
+    "exportedAt": "2026-02-13T17:04:20Z",
+    "exportedBy": "codex",
+    "version": "1"
+  },
+  "workflows": [
+    {
+      "name": "Slack Enquiries → Freshdesk Tickets",
+      "nodes": [
+        {
+          "parameters": {
+            "event": "message.channels",
+            "channel": "={{$env.SLACK_CHANNEL_ID}}",
+            "options": {
+              "resolveIds": true,
+              "ignoreUsers": "={{$env.SLACK_IGNORE_USER_IDS}}"
+            }
+          },
+          "id": "Slack Trigger",
+          "name": "Slack Trigger",
+          "type": "n8n-nodes-base.slackTrigger",
+          "typeVersion": 1,
+          "position": [
+            240,
+            300
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const data = getWorkflowStaticData('global');\nconst now = Date.now();\nconst ttlMs = 1000 * 60 * 60 * 24 * 7;\nif (!data.seen) data.seen = {};\nfor (const [k, v] of Object.entries(data.seen)) {\n  if (!v || (now - v) > ttlMs) delete data.seen[k];\n}\n\nconst e = $json;\nconst channel = e.event?.channel || e.channel || '';\nconst ts = e.event?.ts || e.ts || '';\nconst eventId = e.event_id || `${channel}:${ts}`;\nconst subtype = e.event?.subtype || '';\nconst hasBotId = !!(e.event?.bot_id || e.bot_id);\nconst userId = e.event?.user || e.user || '';\nconst ignoreUsers = String($env.SLACK_IGNORE_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);\nconst ignoreThreadReplies = String($env.SLACK_IGNORE_THREAD_REPLIES || 'true').toLowerCase() === 'true';\nconst isThreadReply = !!(e.event?.thread_ts && e.event?.thread_ts !== e.event?.ts);\nconst isEdit = subtype === 'message_changed';\nconst isBotMessage = subtype === 'bot_message' || hasBotId;\nconst ignoredUser = ignoreUsers.includes(userId);\n\nif (isEdit || isBotMessage || ignoredUser || (ignoreThreadReplies && isThreadReply)) {\n  return [];\n}\n\nif (data.seen[eventId]) {\n  return [];\n}\n\ndata.seen[eventId] = now;\nreturn [{ json: { ...e, _event_key: eventId } }];"
+          },
+          "id": "Filter and Deduplicate",
+          "name": "Filter and Deduplicate",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            500,
+            300
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const e = $json.event || $json;\nconst text = (e.text || '').trim();\nconst fileName = e.files?.[0]?.name ? `\\nFile: ${e.files[0].name}` : '';\nconst attachmentText = Array.isArray(e.attachments) && e.attachments[0]?.text ? `\\nAttachment: ${e.attachments[0].text}` : '';\nconst enquiryText = `${text}${fileName}${attachmentText}`.trim();\n\nconst urgency = /(urgent|asap|outage|down|sev1|critical)/i.test(enquiryText) ? 'high' : (/(soon|today|issue|problem|blocked)/i.test(enquiryText) ? 'medium' : 'low');\nconst confidence = enquiryText.length > 15 ? 0.78 : 0.45;\nconst intent = /(invoice|billing|payment|refund)/i.test(enquiryText) ? 'billing' : (/(error|bug|broken|cannot|can't|login|access|vpn|password|it)/i.test(enquiryText) ? 'it_support' : (/(complaint|unhappy|frustrated)/i.test(enquiryText) ? 'complaint' : 'new_enquiry'));\nconst tags = ['slack', 'enquiry', intent];\nif (confidence < 0.5) tags.push('needs_triage');\n\nconst channel = e.channel || '';\nconst ts = e.ts || '';\nconst permalink = `https://slack.com/archives/${channel}/p${String(ts).replace('.', '')}`;\n\nconst classification = {\n  intent: confidence < 0.5 ? 'other' : intent,\n  category: confidence < 0.5 ? 'triage' : intent.replace('_', ' '),\n  summary: enquiryText.split('\\n')[0].slice(0, 120) || 'Slack enquiry',\n  details: enquiryText ? `- Reported in Slack\\n- Raw: ${enquiryText.slice(0, 1500)}` : '- Reported in Slack',\n  urgency,\n  confidence,\n  suggested_tags: tags,\n  requester_email: '',\n  requester_name: ''\n};\n\nreturn [{ json: {\n  enquiry_text: enquiryText,\n  requester_slack_user_id: e.user || '',\n  channel_id: channel,\n  ts,\n  permalink,\n  classification\n}}];"
+          },
+          "id": "Normalize Text",
+          "name": "Normalize Text",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            760,
+            300
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const c = $json.classification;\nconst urgencyMap = { low: 1, medium: 2, high: 3 };\nconst priorityFromUrgency = urgencyMap[c.urgency] || Number($env.FRESHDESK_DEFAULT_PRIORITY || 2);\nconst tags = Array.from(new Set([...(c.suggested_tags || []), 'slack']));\nconst body = {\n  subject: `[Slack] ${c.summary}`.slice(0, 250),\n  description: [\n    `Slack permalink: ${$json.permalink}`,\n    `Slack channel: ${$json.channel_id}`,\n    `Slack user: ${$json.requester_slack_user_id}`,\n    `Intent: ${c.intent} (confidence: ${c.confidence})`,\n    `Category: ${c.category}`,\n    '',\n    'Details:',\n    c.details\n  ].join('\\n'),\n  priority: priorityFromUrgency,\n  status: Number($env.FRESHDESK_DEFAULT_STATUS || 2),\n  source: Number($env.FRESHDESK_TICKET_SOURCE || 3),\n  tags\n};\nif ($env.FRESHDESK_GROUP_ID) body.group_id = Number($env.FRESHDESK_GROUP_ID);\nif ($env.FRESHDESK_PRODUCT_ID) body.product_id = Number($env.FRESHDESK_PRODUCT_ID);\nreturn [{ json: { ...$json, freshdesk_ticket_body: body } }];"
+          },
+          "id": "Build Ticket Payload",
+          "name": "Build Ticket Payload",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            1020,
+            300
+          ]
+        },
+        {
+          "parameters": {
+            "method": "POST",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/tickets`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Content-Type",
+                  "value": "application/json"
+                },
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={{$json.freshdesk_ticket_body}}",
+            "options": {}
+          },
+          "id": "Create Freshdesk Ticket",
+          "name": "Create Freshdesk Ticket",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            1280,
+            300
+          ],
+          "continueOnFail": true
+        },
+        {
+          "parameters": {
+            "conditions": {
+              "boolean": [
+                {
+                  "value1": "={{!!$json.id}}",
+                  "value2": true
+                }
+              ]
+            }
+          },
+          "id": "Ticket Created?",
+          "name": "Ticket Created?",
+          "type": "n8n-nodes-base.if",
+          "typeVersion": 2,
+          "position": [
+            1530,
+            300
+          ]
+        },
+        {
+          "parameters": {
+            "conditions": {
+              "string": [
+                {
+                  "value1": "={{String($env.SLACK_POST_ACK || 'false').toLowerCase()}}",
+                  "operation": "equal",
+                  "value2": "true"
+                }
+              ]
+            }
+          },
+          "id": "Post Ack Enabled?",
+          "name": "Post Ack Enabled?",
+          "type": "n8n-nodes-base.if",
+          "typeVersion": 2,
+          "position": [
+            1770,
+            220
+          ]
+        },
+        {
+          "parameters": {
+            "resource": "message",
+            "operation": "post",
+            "channel": "={{$json.channel_id}}",
+            "text": "={{`Created Freshdesk ticket #${$node['Create Freshdesk Ticket'].json.id}: https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/a/tickets/${$node['Create Freshdesk Ticket'].json.id}`}}",
+            "otherOptions": {
+              "threadTs": "={{$json.ts}}"
+            }
+          },
+          "id": "Slack Thread Ack",
+          "name": "Slack Thread Ack",
+          "type": "n8n-nodes-base.slack",
+          "typeVersion": 2,
+          "position": [
+            2010,
+            160
+          ],
+          "continueOnFail": true
+        },
+        {
+          "parameters": {
+            "resource": "message",
+            "operation": "post",
+            "channel": "={{$env.SLACK_ACK_CHANNEL_ID || $json.channel_id || $env.SLACK_CHANNEL_ID}}",
+            "text": "={{`Freshdesk ticket creation failed for Slack message ${$json.permalink || 'n/a'}. Error: ${JSON.stringify($node['Create Freshdesk Ticket'].json)}`}}"
+          },
+          "id": "Slack Error Alert",
+          "name": "Slack Error Alert",
+          "type": "n8n-nodes-base.slack",
+          "typeVersion": 2,
+          "position": [
+            1770,
+            420
+          ],
+          "continueOnFail": true
+        }
+      ],
+      "connections": {
+        "Slack Trigger": {
+          "main": [
+            [
+              {
+                "node": "Filter and Deduplicate",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Filter and Deduplicate": {
+          "main": [
+            [
+              {
+                "node": "Normalize Text",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Normalize Text": {
+          "main": [
+            [
+              {
+                "node": "Build Ticket Payload",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Build Ticket Payload": {
+          "main": [
+            [
+              {
+                "node": "Create Freshdesk Ticket",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Create Freshdesk Ticket": {
+          "main": [
+            [
+              {
+                "node": "Ticket Created?",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Ticket Created?": {
+          "main": [
+            [
+              {
+                "node": "Post Ack Enabled?",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            [
+              {
+                "node": "Slack Error Alert",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Post Ack Enabled?": {
+          "main": [
+            [
+              {
+                "node": "Slack Thread Ack",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            []
+          ]
+        }
+      },
+      "settings": {
+        "executionOrder": "v1"
+      },
+      "staticData": null,
+      "pinData": {},
+      "versionId": "1",
+      "meta": {
+        "instanceId": "import-ready"
+      },
+      "id": "1",
+      "active": false
+    },
+    {
+      "name": "Freshdesk Resolved → Knowledge Base Draft",
+      "nodes": [
+        {
+          "parameters": {
+            "httpMethod": "POST",
+            "path": "freshdesk-resolved-kb-draft",
+            "responseMode": "lastNode",
+            "options": {}
+          },
+          "id": "Webhook",
+          "name": "Webhook",
+          "type": "n8n-nodes-base.webhook",
+          "typeVersion": 2,
+          "position": [
+            240,
+            840
+          ],
+          "webhookId": "freshdesk-resolved-kb-draft"
+        },
+        {
+          "parameters": {
+            "jsCode": "const input = $json;\nif (!input.ticket_id) {\n  throw new Error('ticket_id is required');\n}\nreturn [{ json: { ticket_id: Number(input.ticket_id), updated_at: input.updated_at || '', webhook_payload: input } }];"
+          },
+          "id": "Validate Input",
+          "name": "Validate Input",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            480,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const data = getWorkflowStaticData('global');\nif (!data.seen) data.seen = {};\nconst now = Date.now();\nconst ttlMs = 1000 * 60 * 60 * 24 * 60;\nfor (const [k, v] of Object.entries(data.seen)) {\n  if (!v?.t || now - v.t > ttlMs) delete data.seen[k];\n}\nconst key = `${$json.ticket_id}:${$json.updated_at || 'na'}`;\nif (data.seen[key]) return [];\ndata.seen[key] = { t: now };\nreturn [{ json: { ...$json, _dedupe_key: key } }];"
+          },
+          "id": "Deduplicate Webhook",
+          "name": "Deduplicate Webhook",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            720,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "method": "GET",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/tickets/${$json.ticket_id}?include=conversations`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                }
+              ]
+            },
+            "options": {}
+          },
+          "id": "Get Ticket",
+          "name": "Get Ticket",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            960,
+            840
+          ],
+          "continueOnFail": true
+        },
+        {
+          "parameters": {
+            "jsCode": "const t = $json;\nif (!t.id) throw new Error('Freshdesk ticket fetch failed');\nconst conv = Array.isArray(t.conversations) ? t.conversations : [];\nconst agentMessages = conv.filter(c => c.user_id && (c.body_text || c.body));\nconst last = agentMessages[agentMessages.length - 1] || {};\nconst resolution = (last.body_text || last.body || '').replace(/<[^>]+>/g, ' ');\nconst src = `${t.subject || ''}\n\n${(t.description_text || t.description || '').replace(/<[^>]+>/g, ' ')}\n\nResolution:\n${resolution}`;\nreturn [{ json: { ticket: t, kb_source_text: src } }];"
+          },
+          "id": "Extract Ticket Content",
+          "name": "Extract Ticket Content",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            1200,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "let text = $json.kb_source_text || '';\ntext = text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[REDACTED_EMAIL]');\ntext = text.replace(/(?<!\\d)(?:\\+?\\d[\\d\\s().-]{7,}\\d)/g, '[REDACTED_PHONE]');\ntext = text.replace(/\\b\\d{1,5}\\s+[A-Za-z0-9.\\s]{2,}\\s(?:Street|St|Avenue|Ave|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd)\\b/gi, '[REDACTED_ADDRESS]');\ntext = text.replace(/\\b([A-Z][a-z]+\\s+[A-Z][a-z]+)\\b/g, '[REDACTED_NAME]');\nreturn [{ json: { ...$json, redacted_text: text } }];"
+          },
+          "id": "Redact PII",
+          "name": "Redact PII",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            1440,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const txt = $json.redacted_text || '';\nconst subj = ($json.ticket.subject || 'Untitled').replace(/\\s+/g, ' ').trim();\nconst confidence = txt.length > 100 ? 0.82 : 0.55;\nconst steps = [];\nif (/password|login|access/i.test(txt)) {\n  steps.push('Verify account status and reset credentials if needed.');\n  steps.push('Clear cached credentials and retry sign in.');\n}\nif (/error|failed|exception|timeout/i.test(txt)) {\n  steps.push('Capture exact error and timestamp from logs.');\n  steps.push('Apply known fix or rollback recent change.');\n}\nif (!steps.length) steps.push('Review ticket history and apply documented troubleshooting steps.');\n\nconst kb = {\n  should_create_kb: confidence >= Number($env.KB_MIN_CONFIDENCE || 0.75),\n  confidence,\n  kb_title: `How to resolve: ${subj}`.slice(0, 200),\n  kb_problem: txt.slice(0, 400),\n  kb_environment: 'Freshdesk / Slack intake',\n  kb_steps: steps,\n  kb_resolution: 'Issue resolved using validated support workflow and corrective actions.',\n  kb_keywords: Array.from(new Set([...(($json.ticket.tags)||[]), 'support', 'resolved'])).slice(0, 10),\n  kb_folder_name: ($json.ticket.type || 'General').toString().slice(0, 60),\n  kb_article_tags: Array.from(new Set([...(($json.ticket.tags)||[]), 'draft', 'internal'])).slice(0, 15)\n};\nreturn [{ json: { ...$json, kb } }];"
+          },
+          "id": "Draft KB JSON",
+          "name": "Draft KB JSON",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            1680,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "conditions": {
+              "boolean": [
+                {
+                  "value1": "={{$json.kb.should_create_kb}}",
+                  "value2": true
+                }
+              ],
+              "number": [
+                {
+                  "value1": "={{$json.kb.confidence}}",
+                  "operation": "largerEqual",
+                  "value2": "={{Number($env.KB_MIN_CONFIDENCE || 0.75)}}"
+                }
+              ]
+            }
+          },
+          "id": "KB Gate",
+          "name": "KB Gate",
+          "type": "n8n-nodes-base.if",
+          "typeVersion": 2,
+          "position": [
+            1920,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "method": "GET",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/solutions/categories`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                }
+              ]
+            }
+          },
+          "id": "List Categories",
+          "name": "List Categories",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            2160,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const target = String($env.FRESHDESK_KB_CATEGORY_NAME || 'Common Issues');\nconst cats = Array.isArray($json) ? $json : ($json.categories || []);\nconst found = cats.find(c => (c.name || '').toLowerCase() === target.toLowerCase());\nreturn [{ json: { category_id: found?.id || null, category_name: target, original: $input.item.json } }];"
+          },
+          "id": "Find Category",
+          "name": "Find Category",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            2400,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "conditions": {
+              "boolean": [
+                {
+                  "value1": "={{!$json.category_id}}",
+                  "value2": true
+                }
+              ]
+            }
+          },
+          "id": "Category Missing?",
+          "name": "Category Missing?",
+          "type": "n8n-nodes-base.if",
+          "typeVersion": 2,
+          "position": [
+            2640,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "method": "POST",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/solutions/categories`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                },
+                {
+                  "name": "Content-Type",
+                  "value": "application/json"
+                }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={{ { name: $json.category_name, description: 'Auto-created by n8n for draft KB articles' } }}"
+          },
+          "id": "Create Category",
+          "name": "Create Category",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            2880,
+            680
+          ]
+        },
+        {
+          "parameters": {
+            "mode": "combine",
+            "combineBy": "combineByPosition"
+          },
+          "id": "Merge Category",
+          "name": "Merge Category",
+          "type": "n8n-nodes-base.merge",
+          "typeVersion": 3,
+          "position": [
+            3120,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const inputA = $input.first().json;\nconst inputB = $input.last().json;\nconst categoryId = inputA.category_id || inputB.id;\nconst base = inputA.original || {};\nreturn [{ json: { ...base, category_id: categoryId, kb: base.kb } }];"
+          },
+          "id": "Normalize Category",
+          "name": "Normalize Category",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            3360,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "method": "GET",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/solutions/categories/${$json.category_id}/folders`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                }
+              ]
+            }
+          },
+          "id": "List Folders",
+          "name": "List Folders",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            3600,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const folders = Array.isArray($json) ? $json : ($json.folders || []);\nconst desired = ($item(0).$node['Normalize Category'].json.kb.kb_folder_name || 'General').toLowerCase();\nconst found = folders.find(f => (f.name || '').toLowerCase() === desired);\nreturn [{ json: { ...$item(0).$node['Normalize Category'].json, folder_id: found?.id || null } }];"
+          },
+          "id": "Find Folder",
+          "name": "Find Folder",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            3840,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "conditions": {
+              "boolean": [
+                {
+                  "value1": "={{!$json.folder_id}}",
+                  "value2": true
+                }
+              ]
+            }
+          },
+          "id": "Folder Missing?",
+          "name": "Folder Missing?",
+          "type": "n8n-nodes-base.if",
+          "typeVersion": 2,
+          "position": [
+            4080,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "method": "POST",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/solutions/categories/${$json.category_id}/folders`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                },
+                {
+                  "name": "Content-Type",
+                  "value": "application/json"
+                }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={{ { name: $json.kb.kb_folder_name || 'General', description: 'Auto-created by n8n', visibility: Number($env.FRESHDESK_KB_FOLDER_VISIBILITY || 3), language: ($env.FRESHDESK_KB_LANGUAGE || 'en') } }}"
+          },
+          "id": "Create Folder",
+          "name": "Create Folder",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            4320,
+            680
+          ]
+        },
+        {
+          "parameters": {
+            "mode": "combine",
+            "combineBy": "combineByPosition"
+          },
+          "id": "Merge Folder",
+          "name": "Merge Folder",
+          "type": "n8n-nodes-base.merge",
+          "typeVersion": 3,
+          "position": [
+            4560,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const a = $input.first().json;\nconst b = $input.last().json;\nreturn [{ json: { ...a, folder_id: a.folder_id || b.id } }];"
+          },
+          "id": "Normalize Folder",
+          "name": "Normalize Folder",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            4800,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "method": "GET",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/search/solutions?term=${encodeURIComponent($json.kb.kb_title)}`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                }
+              ]
+            }
+          },
+          "id": "Search Articles",
+          "name": "Search Articles",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            5040,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const base = $item(0).$node['Normalize Folder'].json;\nconst res = $json.results || $json;\nconst items = Array.isArray(res) ? res : [];\nconst title = (base.kb.kb_title || '').toLowerCase();\nlet best = null;\nlet bestScore = 0;\nfor (const a of items) {\n  const t = (a.title || '').toLowerCase();\n  const overlap = t.split(' ').filter(w => title.includes(w)).length;\n  const score = title ? overlap / Math.max(title.split(' ').length, 1) : 0;\n  if (score > bestScore) { best = a; bestScore = score; }\n}\nreturn [{ json: { ...base, matched_article_id: bestScore >= 0.6 ? best?.id : null } }];"
+          },
+          "id": "Find Article Match",
+          "name": "Find Article Match",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            5280,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "conditions": {
+              "boolean": [
+                {
+                  "value1": "={{!!$json.matched_article_id}}",
+                  "value2": true
+                }
+              ]
+            }
+          },
+          "id": "Article Exists?",
+          "name": "Article Exists?",
+          "type": "n8n-nodes-base.if",
+          "typeVersion": 2,
+          "position": [
+            5520,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "jsCode": "const kb = $json.kb;\nconst desc = `<h3>Problem</h3><p>${kb.kb_problem}</p><h3>Environment</h3><p>${kb.kb_environment}</p><h3>Steps</h3><ol>${kb.kb_steps.map(s=>`<li>${s}</li>`).join('')}</ol><h3>Resolution</h3><p>${kb.kb_resolution}</p>`;\nreturn [{ json: { ...$json, kb_payload: { title: kb.kb_title, description: desc, status: 1, tags: kb.kb_article_tags } } }];"
+          },
+          "id": "Build Article Payload",
+          "name": "Build Article Payload",
+          "type": "n8n-nodes-base.code",
+          "typeVersion": 2,
+          "position": [
+            5760,
+            760
+          ]
+        },
+        {
+          "parameters": {
+            "method": "PUT",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/solutions/articles/${$json.matched_article_id}`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                },
+                {
+                  "name": "Content-Type",
+                  "value": "application/json"
+                }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={{$json.kb_payload}}"
+          },
+          "id": "Update Article Draft",
+          "name": "Update Article Draft",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            6000,
+            680
+          ]
+        },
+        {
+          "parameters": {
+            "method": "POST",
+            "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/solutions/folders/${$json.folder_id}/articles`}}",
+            "sendHeaders": true,
+            "headerParameters": {
+              "parameters": [
+                {
+                  "name": "Authorization",
+                  "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+                },
+                {
+                  "name": "Content-Type",
+                  "value": "application/json"
+                }
+              ]
+            },
+            "sendBody": true,
+            "specifyBody": "json",
+            "jsonBody": "={{$json.kb_payload}}"
+          },
+          "id": "Create Article Draft",
+          "name": "Create Article Draft",
+          "type": "n8n-nodes-base.httpRequest",
+          "typeVersion": 4.2,
+          "position": [
+            6000,
+            840
+          ]
+        },
+        {
+          "parameters": {
+            "resource": "message",
+            "operation": "post",
+            "channel": "={{$env.SLACK_ACK_CHANNEL_ID || $env.SLACK_CHANNEL_ID}}",
+            "text": "={{`KB workflow skipped or failed for ticket ${$node['Validate Input'].json.ticket_id}.`}}"
+          },
+          "id": "Slack KB Error",
+          "name": "Slack KB Error",
+          "type": "n8n-nodes-base.slack",
+          "typeVersion": 2,
+          "position": [
+            2160,
+            980
+          ],
+          "continueOnFail": true
+        }
+      ],
+      "connections": {
+        "Webhook": {
+          "main": [
+            [
+              {
+                "node": "Validate Input",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Validate Input": {
+          "main": [
+            [
+              {
+                "node": "Deduplicate Webhook",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Deduplicate Webhook": {
+          "main": [
+            [
+              {
+                "node": "Get Ticket",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Get Ticket": {
+          "main": [
+            [
+              {
+                "node": "Extract Ticket Content",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Extract Ticket Content": {
+          "main": [
+            [
+              {
+                "node": "Redact PII",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Redact PII": {
+          "main": [
+            [
+              {
+                "node": "Draft KB JSON",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Draft KB JSON": {
+          "main": [
+            [
+              {
+                "node": "KB Gate",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "KB Gate": {
+          "main": [
+            [
+              {
+                "node": "List Categories",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            [
+              {
+                "node": "Slack KB Error",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "List Categories": {
+          "main": [
+            [
+              {
+                "node": "Find Category",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Find Category": {
+          "main": [
+            [
+              {
+                "node": "Category Missing?",
+                "type": "main",
+                "index": 0
+              },
+              {
+                "node": "Merge Category",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Category Missing?": {
+          "main": [
+            [
+              {
+                "node": "Create Category",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            [
+              {
+                "node": "Merge Category",
+                "type": "main",
+                "index": 1
+              }
+            ]
+          ]
+        },
+        "Create Category": {
+          "main": [
+            [
+              {
+                "node": "Merge Category",
+                "type": "main",
+                "index": 1
+              }
+            ]
+          ]
+        },
+        "Merge Category": {
+          "main": [
+            [
+              {
+                "node": "Normalize Category",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Normalize Category": {
+          "main": [
+            [
+              {
+                "node": "List Folders",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "List Folders": {
+          "main": [
+            [
+              {
+                "node": "Find Folder",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Find Folder": {
+          "main": [
+            [
+              {
+                "node": "Folder Missing?",
+                "type": "main",
+                "index": 0
+              },
+              {
+                "node": "Merge Folder",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Folder Missing?": {
+          "main": [
+            [
+              {
+                "node": "Create Folder",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            [
+              {
+                "node": "Merge Folder",
+                "type": "main",
+                "index": 1
+              }
+            ]
+          ]
+        },
+        "Create Folder": {
+          "main": [
+            [
+              {
+                "node": "Merge Folder",
+                "type": "main",
+                "index": 1
+              }
+            ]
+          ]
+        },
+        "Merge Folder": {
+          "main": [
+            [
+              {
+                "node": "Normalize Folder",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Normalize Folder": {
+          "main": [
+            [
+              {
+                "node": "Search Articles",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Search Articles": {
+          "main": [
+            [
+              {
+                "node": "Find Article Match",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Find Article Match": {
+          "main": [
+            [
+              {
+                "node": "Build Article Payload",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Article Exists?": {
+          "main": [
+            [
+              {
+                "node": "Update Article Draft",
+                "type": "main",
+                "index": 0
+              }
+            ],
+            [
+              {
+                "node": "Create Article Draft",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        },
+        "Build Article Payload": {
+          "main": [
+            [
+              {
+                "node": "Article Exists?",
+                "type": "main",
+                "index": 0
+              }
+            ]
+          ]
+        }
+      },
+      "settings": {
+        "executionOrder": "v1"
+      },
+      "staticData": null,
+      "pinData": {},
+      "versionId": "1",
+      "meta": {
+        "instanceId": "import-ready"
+      },
+      "id": "2",
+      "active": false
+    }
+  ],
+  "credentials": []
+}
