@@ -1,0 +1,367 @@
+{
+  "name": "Slack Enquiries → Freshdesk Tickets",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "message.channels",
+        "channel": "={{$env.SLACK_CHANNEL_ID}}",
+        "options": {
+          "resolveIds": true,
+          "ignoreUsers": "={{$env.SLACK_IGNORE_USER_IDS}}"
+        }
+      },
+      "id": "Slack Trigger",
+      "name": "Slack Trigger",
+      "type": "n8n-nodes-base.slackTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = getWorkflowStaticData('global');\nconst now = Date.now();\nconst ttlMs = 1000 * 60 * 60 * 24 * 7;\nif (!data.seen) data.seen = {};\nfor (const [k, v] of Object.entries(data.seen)) {\n  if (!v || (now - v) > ttlMs) delete data.seen[k];\n}\n\nconst e = $json;\nconst channel = e.event?.channel || e.channel || '';\nconst ts = e.event?.ts || e.ts || '';\nconst eventId = e.event_id || `${channel}:${ts}`;\nconst subtype = e.event?.subtype || '';\nconst hasBotId = !!(e.event?.bot_id || e.bot_id);\nconst userId = e.event?.user || e.user || '';\nconst ignoreUsers = String($env.SLACK_IGNORE_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);\nconst ignoreThreadReplies = String($env.SLACK_IGNORE_THREAD_REPLIES || 'true').toLowerCase() === 'true';\nconst isThreadReply = !!(e.event?.thread_ts && e.event?.thread_ts !== e.event?.ts);\nconst isEdit = subtype === 'message_changed';\nconst isBotMessage = subtype === 'bot_message' || hasBotId;\nconst ignoredUser = ignoreUsers.includes(userId);\n\nif (isEdit || isBotMessage || ignoredUser || (ignoreThreadReplies && isThreadReply)) {\n  return [];\n}\n\nif (data.seen[eventId]) {\n  return [];\n}\n\ndata.seen[eventId] = now;\nreturn [{ json: { ...e, _event_key: eventId } }];"
+      },
+      "id": "Filter and Deduplicate",
+      "name": "Filter and Deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const e = $json.event || $json;\nconst text = (e.text || '').trim();\nconst fileName = e.files?.[0]?.name ? `\\nFile: ${e.files[0].name}` : '';\nconst attachmentText = Array.isArray(e.attachments) && e.attachments[0]?.text ? `\\nAttachment: ${e.attachments[0].text}` : '';\nconst enquiryText = `${text}${fileName}${attachmentText}`.trim();\n\nconst urgency = /(urgent|asap|outage|down|sev1|critical)/i.test(enquiryText) ? 'high' : (/(soon|today|issue|problem|blocked)/i.test(enquiryText) ? 'medium' : 'low');\nconst confidence = enquiryText.length > 15 ? 0.78 : 0.45;\nconst intent = /(invoice|billing|payment|refund)/i.test(enquiryText) ? 'billing' : (/(error|bug|broken|cannot|can't|login|access|vpn|password|it)/i.test(enquiryText) ? 'it_support' : (/(complaint|unhappy|frustrated)/i.test(enquiryText) ? 'complaint' : 'new_enquiry'));\nconst tags = ['slack', 'enquiry', intent];\nif (confidence < 0.5) tags.push('needs_triage');\n\nconst channel = e.channel || '';\nconst ts = e.ts || '';\nconst permalink = `https://slack.com/archives/${channel}/p${String(ts).replace('.', '')}`;\n\nconst fallbackClassification = {\n  intent: confidence < 0.5 ? 'other' : intent,\n  category: confidence < 0.5 ? 'triage' : intent.replace('_', ' '),\n  summary: enquiryText.split('\\n')[0].slice(0, 120) || 'Slack enquiry',\n  details: enquiryText ? `- Reported in Slack\\n- Raw: ${enquiryText.slice(0, 1500)}` : '- Reported in Slack',\n  urgency,\n  confidence,\n  suggested_tags: tags,\n  requester_email: '',\n  requester_name: ''\n};\n\nreturn [{ json: {\n  enquiry_text: enquiryText,\n  requester_slack_user_id: e.user || '',\n  channel_id: channel,\n  ts,\n  permalink,\n  fallback_classification: fallbackClassification\n}}];"
+      },
+      "id": "Normalize Text",
+      "name": "Normalize Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{`Bearer ${$env.OPENAI_API_KEY}`}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: $env.OPENAI_MODEL || 'gpt-4.1-mini', input: [ { role: 'system', content: 'You are a support triage classifier. Return strict JSON only with keys: intent, category, summary, details, urgency, confidence, suggested_tags, requester_email, requester_name. Valid intent: new_enquiry|existing_matter|billing|complaint|ops|it_support|other. Valid urgency: low|medium|high. confidence must be 0..1.' }, { role: 'user', content: `Classify this Slack enquiry and return JSON only.\\n\\n${$json.enquiry_text}` } ], text: { format: { type: 'json_object' } } } }}",
+        "options": {}
+      },
+      "id": "OpenAI Classify Enquiry",
+      "name": "OpenAI Classify Enquiry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1020,
+        120
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition"
+      },
+      "id": "Merge Normalized + AI",
+      "name": "Merge Normalized + AI",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        1260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $input.first().json || {};\nconst ai = $input.last().json || {};\nconst fallback = base.fallback_classification || {};\n\nconst pickText = () => {\n  if (typeof ai.output_text === 'string' && ai.output_text.trim()) return ai.output_text;\n  const c = ai?.output?.[0]?.content;\n  if (Array.isArray(c)) {\n    const t = c.find(x => x.type === 'output_text' || x.type === 'text');\n    if (t?.text) return t.text;\n  }\n  const msg = ai?.choices?.[0]?.message?.content;\n  if (typeof msg === 'string') return msg;\n  return '';\n};\n\nconst extractJson = (raw) => {\n  if (!raw) return null;\n  try { return JSON.parse(raw); } catch {}\n  const s = raw.indexOf('{');\n  const e = raw.lastIndexOf('}');\n  if (s >= 0 && e > s) {\n    try { return JSON.parse(raw.slice(s, e + 1)); } catch {}\n  }\n  return null;\n};\n\nconst parsed = extractJson(pickText()) || {};\nconst cls = {\n  intent: parsed.intent || fallback.intent || 'other',\n  category: parsed.category || fallback.category || 'triage',\n  summary: parsed.summary || fallback.summary || 'Slack enquiry',\n  details: parsed.details || fallback.details || '- Reported in Slack',\n  urgency: ['low','medium','high'].includes(parsed.urgency) ? parsed.urgency : (fallback.urgency || 'medium'),\n  confidence: Number.isFinite(Number(parsed.confidence)) ? Number(parsed.confidence) : Number(fallback.confidence || 0.4),\n  suggested_tags: Array.isArray(parsed.suggested_tags) ? parsed.suggested_tags : (fallback.suggested_tags || ['slack','enquiry']),\n  requester_email: typeof parsed.requester_email === 'string' ? parsed.requester_email : (fallback.requester_email || ''),\n  requester_name: typeof parsed.requester_name === 'string' ? parsed.requester_name : (fallback.requester_name || '')\n};\n\nif (cls.confidence < 0.5) {\n  cls.intent = 'other';\n  if (!cls.suggested_tags.includes('needs_triage')) cls.suggested_tags.push('needs_triage');\n}\n\nreturn [{ json: { ...base, classification: cls } }];"
+      },
+      "id": "Parse AI Classification",
+      "name": "Parse AI Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const c = $json.classification;\nconst urgencyMap = { low: 1, medium: 2, high: 3 };\nconst priorityFromUrgency = urgencyMap[c.urgency] || Number($env.FRESHDESK_DEFAULT_PRIORITY || 2);\nconst tags = Array.from(new Set([...(c.suggested_tags || []), 'slack']));\nconst body = {\n  subject: `[Slack] ${c.summary}`.slice(0, 250),\n  description: [\n    `Slack permalink: ${$json.permalink}`,\n    `Slack channel: ${$json.channel_id}`,\n    `Slack user: ${$json.requester_slack_user_id}`,\n    `Intent: ${c.intent} (confidence: ${c.confidence})`,\n    `Category: ${c.category}`,\n    '',\n    'Details:',\n    c.details\n  ].join('\\n'),\n  priority: priorityFromUrgency,\n  status: Number($env.FRESHDESK_DEFAULT_STATUS || 2),\n  source: Number($env.FRESHDESK_TICKET_SOURCE || 3),\n  tags\n};\nif ($env.FRESHDESK_GROUP_ID) body.group_id = Number($env.FRESHDESK_GROUP_ID);\nif ($env.FRESHDESK_PRODUCT_ID) body.product_id = Number($env.FRESHDESK_PRODUCT_ID);\nreturn [{ json: { ...$json, freshdesk_ticket_body: body } }];"
+      },
+      "id": "Build Ticket Payload",
+      "name": "Build Ticket Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{`https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/api/v2/tickets`}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Authorization",
+              "value": "={{ 'Basic ' + Buffer.from(($env.FRESHDESK_API_KEY || '') + ':X').toString('base64') }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.freshdesk_ticket_body}}",
+        "options": {}
+      },
+      "id": "Create Freshdesk Ticket",
+      "name": "Create Freshdesk Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        300
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{!!$json.id}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "Ticket Created?",
+      "name": "Ticket Created?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{String($env.SLACK_POST_ACK || 'false').toLowerCase()}}",
+              "operation": "equal",
+              "value2": "true"
+            }
+          ]
+        }
+      },
+      "id": "Post Ack Enabled?",
+      "name": "Post Ack Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "={{$json.channel_id}}",
+        "text": "={{`Created Freshdesk ticket #${$node['Create Freshdesk Ticket'].json.id}: https://${$env.FRESHDESK_DOMAIN}.freshdesk.com/a/tickets/${$node['Create Freshdesk Ticket'].json.id}`}}",
+        "otherOptions": {
+          "threadTs": "={{$json.ts}}"
+        }
+      },
+      "id": "Slack Thread Ack",
+      "name": "Slack Thread Ack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        2700,
+        160
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": "={{$env.SLACK_ACK_CHANNEL_ID || $json.channel_id || $env.SLACK_CHANNEL_ID}}",
+        "text": "={{`Freshdesk ticket creation failed for Slack message ${$json.permalink || 'n/a'}. Error: ${JSON.stringify($node['Create Freshdesk Ticket'].json)}`}}"
+      },
+      "id": "Slack Error Alert",
+      "name": "Slack Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        420
+      ],
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Slack Trigger": {
+      "main": [
+        [
+          {
+            "node": "Filter and Deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter and Deduplicate": {
+      "main": [
+        [
+          {
+            "node": "Normalize Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Text": {
+      "main": [
+        [
+          {
+            "node": "OpenAI Classify Enquiry",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge Normalized + AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Ticket Payload": {
+      "main": [
+        [
+          {
+            "node": "Create Freshdesk Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Freshdesk Ticket": {
+      "main": [
+        [
+          {
+            "node": "Ticket Created?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ticket Created?": {
+      "main": [
+        [
+          {
+            "node": "Post Ack Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Ack Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Slack Thread Ack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "OpenAI Classify Enquiry": {
+      "main": [
+        [
+          {
+            "node": "Merge Normalized + AI",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Normalized + AI": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Classification": {
+      "main": [
+        [
+          {
+            "node": "Build Ticket Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "1",
+  "meta": {
+    "instanceId": "import-ready"
+  },
+  "id": "1",
+  "active": false
+}
